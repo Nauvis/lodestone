@@ -1,4 +1,5 @@
 use failure::Fail;
+use std::fmt;
 use std::str::FromStr;
 
 #[derive(Clone, Debug, Fail)]
@@ -24,5 +25,18 @@ impl FromStr for GrandCompany {
             "" | "NONE" | "UNAFFILIATED" => Ok(GrandCompany::Unaffiliated),
             x => Err(GrandCompanyParseError(x.into())),
         }
+    }
+}
+
+impl fmt::Display for GrandCompany {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let grandcompany = match *self {
+            GrandCompany::Maelstrom => "Maelstrom",
+            GrandCompany::TwinAdder => "Order of the Twin Adder",
+            GrandCompany::ImmortalFlames => "Immortal Flames",
+            GrandCompany::Unaffiliated => "Unaffiliated",
+        };
+
+        write!(f, "{}", grandcompany)
     }
 }

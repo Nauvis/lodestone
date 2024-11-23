@@ -1,15 +1,20 @@
 use failure::{Error, Fail, ensure};
 use select::document::Document;
 use select::predicate::{Class, Name};
+use tokio::runtime::Runtime;
 
+use std::default;
 use std::str::FromStr;
 
+use crate::model::class;
 use crate::model::{
     attribute::{Attribute, Attributes},
+    gear::{Slot, EquippedGear},
     clan::Clan,
+    gc::GrandCompany,
     class::{Classes, ClassInfo, ClassType},
-    gender::Gender, 
-    race::Race, 
+    gender::Gender,
+    race::Race,
     server::Server,
     datacenter::Datacenter,
     util::load_url
@@ -33,9 +38,30 @@ struct CharInfo {
     gender: Gender,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 struct HomeInfo {
     server: Server,
     datacenter: Datacenter,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+struct PlayerInfo {
+    class: Option<ClassType>,
+    level: u32,
+    image_url: String,
+}
+
+#[derive(Clone, Debug, Eq, Default, PartialEq, Ord, PartialOrd, Hash)]
+pub struct FreeCompanyInfo {
+    name: String,
+    url: String,
+    icon: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct FieldOps {
+    bozja: Option<u32>,
+    eureka: Option<u32>
 }
 
 /// Takes a Document and a search expression, and will return
@@ -45,7 +71,7 @@ macro_rules! ensure_node {
     ($doc:ident, $search:expr) => {{
         ensure_node!($doc, $search, 0)
     }};
-    
+
     ($doc:ident, $search:expr, $nth:expr) => {{
         let node = $doc.find($search).nth($nth);
         ensure!(node.is_some(), SearchError::NodeNotFound(stringify!($search).to_string() + "(" + stringify!($nth) + ")"));
@@ -59,7 +85,7 @@ pub struct Profile {
     /// The id associated with the profile
     pub user_id: u32,
     /// The profile's associated Free Company
-    pub free_company: Option<String>,
+    pub free_company: Option<FreeCompanyInfo>,
     /// The profile's title
     pub title: Option<String>,
     /// The character's in-game name.
@@ -70,6 +96,8 @@ pub struct Profile {
     pub guardian: String,
     /// The character's city state
     pub city_state: String,
+    /// The character's grand company
+    pub gc: GrandCompany,
     /// Which server the character is in.
     pub server: Server,
     /// Which datacenter the character is in.
@@ -84,6 +112,16 @@ pub struct Profile {
     pub hp: u32,
     /// Max MP.
     pub mp: u32,
+    /// Current class
+    pub class: Option<ClassType>,
+    /// Current class's level
+    pub level: u32,
+    /// Link to the character image
+    pub image_url: String,
+    /// A list of field operation levels
+    pub fieldops: FieldOps,
+    /// A list of gear slots
+    pub gear: EquippedGear,
     /// A list of attributes and their values.
     pub attributes: Attributes,
     /// A list of classes and their corresponding levels.
@@ -92,12 +130,28 @@ pub struct Profile {
 
 impl Profile {
     /// Gets a profile for a user given their lodestone user id.
-    /// 
-    /// If you don't have the id, it is possible to use a 
+    ///
+    /// If you don't have the id, it is possible to use a
     /// `SearchBuilder` in order to find their profile directly.
     pub fn get(user_id: u32) -> Result<Self, Error> {
-        let main_doc = load_url(user_id, None)?;
-        let classes_doc = load_url(user_id, Some("class_job"))?;
+        let url_thread = std::thread::spawn(move ||{
+            let profile_thread = std::thread::spawn(move || {
+                load_url(user_id, None)
+            });
+            let classjob_thread = std::thread::spawn(move || {
+                load_url(user_id, Some("class_job"))
+            });
+
+            let main_doc = profile_thread.join().unwrap();
+            let classes_doc = classjob_thread.join().unwrap();
+
+            (main_doc, classes_doc)
+        });
+        let thread_result = url_thread.join().unwrap();
+        
+        let main_doc = Document::from_read(thread_result.0?.as_bytes())?;
+        let classes_doc = Document::from_read(thread_result.1?.as_bytes())?;
+
 
         //  Holds the string for Race, Clan, and Gender in that order
         let char_info = Self::parse_char_info(&main_doc)?;
@@ -107,14 +161,17 @@ impl Profile {
 
         let (hp, mp) = Self::parse_char_param(&main_doc)?;
 
+        let (player_info, gear) = Self::parse_profile_info(&main_doc)?;
+
         Ok(Self {
             user_id,
-            free_company: Self::parse_free_company(&main_doc),
-            title: Self::parse_title(&main_doc),
+            free_company: Self::parse_free_company(&main_doc)?,
+            title: Self::parse_title(&main_doc)?,
             name: Self::parse_name(&main_doc)?,
             nameday: Self::parse_nameday(&main_doc)?,
             guardian: Self::parse_guardian(&main_doc)?,
             city_state: Self::parse_city_state(&main_doc)?,
+            gc: Self::parse_grand_company(&main_doc)?,
             server: home_info.server,
             datacenter: home_info.datacenter,
             race: char_info.race,
@@ -122,15 +179,20 @@ impl Profile {
             gender: char_info.gender,
             hp,
             mp,
+            class: player_info.class,
+            level: player_info.level,
+            image_url: player_info.image_url,
+            gear,
+            fieldops: Self::parse_fieldops(&classes_doc)?,
             attributes: Self::parse_attributes(&main_doc)?,
             classes: Self::parse_classes(&classes_doc)?,
         })
     }
 
     /// Get the level of a specific class for this profile.
-    /// 
+    ///
     /// This can be used to query whether or not a job is unlocked.
-    /// For instance if Gladiator is below 30, then Paladin will 
+    /// For instance if Gladiator is below 30, then Paladin will
     /// return None. If Paladin is unlocked, both Gladiator and
     /// Paladin will return the same level.
     pub fn level(&self, class: ClassType) -> Option<u32> {
@@ -150,19 +212,39 @@ impl Profile {
         &self.classes
     }
 
-    fn parse_free_company(doc: &Document) -> Option<String> {
-        match doc.find(Class("character__freecompany__name")).next() {
-            Some(node) => Some(
-                node.text().strip_prefix("Free Company").unwrap_or(&node.text()).to_string()
-            ),
-            None => None,
-        }
+    fn parse_free_company(doc: &Document) -> Result<Option<FreeCompanyInfo>, Error> {
+        let attr_block = ensure_node!(doc, Class("character__profile__data__detail"));
+
+        let fc_block = attr_block.find(Class("character-block")).nth(4);
+        // no block = no fc
+        if fc_block.is_none() { return Ok(None) }
+
+        let name = fc_block.unwrap().find(Class("character__freecompany__name")).next().unwrap()
+            .find(Name("a")).next().unwrap()
+            .text();
+
+        let mut url = fc_block.unwrap().find(Class("character__freecompany__name")).next().unwrap()
+                .find(Name("a")).next().unwrap()
+                .attr("href").unwrap()
+                .to_string();
+        url = "https://na.finalfantasyxiv.com".to_owned() + &url;
+
+        let icon = doc.find(Class("character__freecompany__crest__image")).next().unwrap()
+            .last_child().unwrap()
+            .attr("src").unwrap()
+            .to_string();
+
+        Ok(Some(FreeCompanyInfo {
+            name,
+            url,
+            icon,
+        }))
     }
 
-    fn parse_title(doc: &Document) -> Option<String> {
+    fn parse_title(doc: &Document) -> Result<Option<String>, Error> {
         match doc.find(Class("frame__chara__title")).next() {
-            Some(node) => Some(node.text()),
-            None => None,
+            Some(node) => Ok(Some(node.text())),
+            None => Ok(None),
         }
     }
 
@@ -182,6 +264,20 @@ impl Profile {
         Ok(ensure_node!(doc, Class("character-block__name"), 2).text())
     }
 
+    fn parse_grand_company(doc: &Document) -> Result<GrandCompany, Error> {
+        let attr_block = ensure_node!(doc, Class("character__profile__data__detail"));
+        
+        let binding = attr_block.find(Class("character-block__name")).nth(3).unwrap()
+            .text();
+        let gc_block = binding
+            .split(" / ")
+            .next().unwrap();
+
+        let gc = GrandCompany::from_str(gc_block);
+
+        Ok(gc.unwrap())
+    }
+
     fn parse_home_info(doc: &Document) -> Result<HomeInfo, Error> {
         let text = ensure_node!(doc, Class("frame__chara__world")).text();
         let mut server = text.split("\u{A0}").next();
@@ -194,7 +290,7 @@ impl Profile {
             .split_whitespace()
             .map(|e| e.replace(&['[', ']'], ""))
             .collect::<Vec<String>>();
-            
+
         Ok(HomeInfo {
             server: Server::from_str(&home_info[0])?,
             datacenter: Datacenter::from_str(&home_info[1])?,
@@ -231,6 +327,150 @@ impl Profile {
                 gender: Gender::from_str(&char_info[2])?,
             })
         }
+    }
+
+    fn parse_profile_info(doc: &Document) -> Result<(PlayerInfo, EquippedGear), Error> {
+        let attr_block = ensure_node!(doc, Class("character__profile__detail"));
+        // comes in format `LEVEL 81 `, trailing space included
+        let level: u32 = ensure_node!(attr_block, Class("character__class__data"))
+            .text()
+            .replace("LEVEL", "")
+            .replace(" ", "")
+            .parse::<u32>()
+            .unwrap_or(0);
+
+        let class: Option<ClassType> = 'class: {
+            // get the job icon url
+            let class_icon = ensure_node!(attr_block, Class("character__class_icon"))
+            .first_child()
+            .unwrap()
+            .attr("src");
+            if class_icon.is_none() {
+                break 'class None;
+            }
+
+            match ClassType::from_str(class_icon.unwrap()) {
+                Ok(class_type) => Some(class_type),
+                Err(_) => None,
+            }
+        };
+
+        let image_url: String = {
+            ensure_node!(attr_block, Class("character__detail__image"))
+            .first_child()
+            .unwrap()
+            .attr("href")
+            .unwrap()
+            .to_owned()
+        };
+
+        // loop through gear slots and push them to the vec
+        let mut equipped_gear = Vec::with_capacity(14);
+        for item in attr_block.find(Class("js__db_tooltip")) {
+            // childless div = empty slot
+            if item.first_child().is_none() {
+                equipped_gear.push(None);
+                continue;
+            }
+
+            let mut slot = Slot::default();
+            slot.name = {
+                match item.find(Class("db-tooltip__item__name")).next() {
+                    Some(node) => Some(node.text()),
+                    None => None,
+                }
+            };
+            slot.glamour_name = {
+                // using the `view item details` button on hover, and fetching the parent <p>'s text
+                match item.find(Class("db-tooltip__item__mirage__btn")).next() {
+                    Some(node) => Some(
+                        node.parent()
+                        .unwrap()
+                        .text()
+                    ),
+                    None => None,
+                }
+            };
+            slot.ilvl = {
+                match item.find(Class("db-tooltip__item__level")).next() {
+                    Some(node) => Some(
+                        // comes in format `Item Level 630`
+                        node.text()
+                        .replace("Item Level ", "")
+                        .parse::<u32>()
+                        .unwrap_or(0)
+                    ),
+                    None => None,
+                }
+            };
+            equipped_gear.push(Some(slot));
+        };
+
+        Ok(
+            (PlayerInfo {
+                class,
+                level,
+                image_url,
+            },
+            EquippedGear {
+                mainhand:       equipped_gear[0].clone(),
+                head:           equipped_gear[1].clone(),
+                body:           equipped_gear[2].clone(),
+                hands:          equipped_gear[3].clone(),
+                legs:           equipped_gear[4].clone(),
+                feet:           equipped_gear[5].clone(),
+                facewear:       equipped_gear[6].clone(),
+                offhand:        equipped_gear[7].clone(),
+                earrings:       equipped_gear[8].clone(),
+                necklace:       equipped_gear[9].clone(),
+                bracelets:      equipped_gear[10].clone(),
+                ring_left:      equipped_gear[11].clone(),
+                ring_right:     equipped_gear[12].clone(),
+                soul_crystal:   equipped_gear[13].clone(),
+            }
+        ))
+    }
+
+    fn parse_fieldops(doc: &Document) -> Result<FieldOps, Error> {
+        let attr_block = ensure_node!(doc, Class("character__content"));
+
+        // if not unlocked, the corresponding div is absent. otherwise its all there
+        let bozja: Option<u32> = {
+            match doc.find(Class("xiv-lds-resistance-level")).next() {
+                Some(node) => Some(
+                    node
+                    .parent().unwrap()
+                    .parent().unwrap()
+                    .find(Class("character__job__level"))
+                    .next().unwrap()
+                    .text()
+                    .parse::<u32>()
+                    .unwrap_or(0)
+                ),
+                None => None,
+            }
+        };
+
+        let eureka: Option<u32> = {
+            match doc.find(Class("xiv-lds-elemental-level")).next() {
+                Some(node) => Some(
+                    node
+                    .parent().unwrap()
+                    .parent().unwrap()
+                    .find(Class("character__job__level"))
+                    .next().unwrap()
+                    .text()
+                    .parse::<u32>()
+                    .unwrap_or(0)
+                ),
+                None => None,
+            }
+        };
+
+        Ok(FieldOps {
+            bozja,
+            eureka,
+        })
     }
 
     fn parse_char_param(doc: &Document) -> Result<(u32, u32), Error> {
